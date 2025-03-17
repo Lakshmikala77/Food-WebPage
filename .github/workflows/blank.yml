@@ -1,0 +1,291 @@
+Build:
+    # needs: tests_coverage
+    name: Build SubGraph Application
+    runs-on: ubuntu-latest
+ 
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+        subgraph_names_json: ${{ steps.extract_subgraphs.outputs.SUBGRAPH_NAMES_JSON }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Run Action for Retrieving PR Title
+      uses: ./.github/actions/get-pr-title
+    
+    - name: Run Action for Getting AP DEV Environmental Variables
+      uses: ./.github/actions/get-inputs-dev/ap-dev
+
+    - name: Extract Subgraph Names from PR
+      id: extract_subgraphs
+      run: |
+        PR_BODY=$(jq -r '.pull_request.body' < "$GITHUB_EVENT_PATH")
+        echo "PR_BODY Content: $PR_BODY"
+        SUBGRAPH_NAMES=()
+        while IFS= read -r line; do
+          SUBGRAPH=$(echo "$line" | awk -F'`' '{print $2}' | tr -d '\r')
+          if [[ -n "$SUBGRAPH" ]]; then
+            SUBGRAPH_NAMES+=("$SUBGRAPH")
+          fi
+        done < <(echo "$PR_BODY" | grep -i "Subgraph Name:")
+
+        # Convert to valid JSON array
+        SUBGRAPH_JSON=$(printf '%s\n' "${SUBGRAPH_NAMES[@]}" | jq -R . | jq -s .)
+        echo "Extracted JSON: $SUBGRAPH_JSON"
+
+        # Fix output formatting
+        echo "SUBGRAPH_NAMES_JSON<<EOF" >> "$GITHUB_OUTPUT"
+        echo "$SUBGRAPH_JSON" >> "$GITHUB_OUTPUT"
+        echo "EOF" >> "$GITHUB_OUTPUT"
+
+  Build_Subgraphs:
+    needs: Build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        subgraph: ${{ fromJson(needs.build.outputs.subgraph_names_json) }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+  
+      - name: Run Action for Retrieving PR Title
+        uses: ./.github/actions/get-pr-title
+      
+      - name: Run Action for Getting AP DEV Environmental Variables
+        uses: ./.github/actions/get-inputs-dev/ap-dev
+
+
+      - name: Extract and set Deployment Name
+        run: |
+          SUBGRAPH_NAME="${{ matrix.subgraph }}"
+          DEPLOYMENT_NAME=$(echo "$SUBGRAPH_NAME" | tr '[:upper:]' '[:lower:]')          
+          echo "SUBGRAPH_NAME=$SUBGRAPH_NAME" >> $GITHUB_ENV
+          echo "DEPLOYMENT_NAME=$DEPLOYMENT_NAME" >> $GITHUB_ENV
+
+    ### Printing Variables for Testing ### 
+      - run: |
+          echo ${{ env.APOLLO_URL }}
+          echo ${{ env.GKE_PROJECT }}
+          echo ${{ env.SUBGRAPH_NAME }}
+          echo ${{ env.NAMESPACE }}
+          echo ${{ env.FAST_SERVICE_ACCOUNT }}
+          echo ${{ env.REGION }}
+
+
+      - name: Run Action for GCP Authentication
+        uses: ./.github/actions/gcp_authentication
+
+  
+      - name: Run Action for Installing packages
+        uses: ./.github/actions/installing_packages
+
+    ### Docker Image Creation ###
+      - name: Create docker image
+        run:
+          npx nx container ${{env.SUBGRAPH_NAME}} --verbose
+        env:
+          INPUT_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    ### Authenticate to Artifact Registry ###
+      - name: Configure Docker CLI
+        run: |
+          gcloud auth list
+          gcloud auth configure-docker ${{ env.GCP_AR_URL }} -q
+      - name: Docker list
+        run: docker images
+
+    ### Docker Image Tag ###
+      - name: Tag Docker image
+        run: |         
+          docker tag ${{ env.DEPLOYMENT_NAME }}:latest ${{ env.GCP_AR_URL }}/${{ env.NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:${{ env.VERSION_NUMBER }}
+          docker tag ${{ env.DEPLOYMENT_NAME }}:latest ${{ env.GCP_AR_URL }}/${{ env.NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:latest
+          docker tag ${{ env.DEPLOYMENT_NAME }}:latest ${{ env.GCP_AR_URL }}/${{ env.PREDEV_NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:${{ env.VERSION_NUMBER }}
+          docker tag ${{ env.DEPLOYMENT_NAME }}:latest ${{ env.GCP_AR_URL }}/${{ env.PREDEV_NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:latest
+          
+    ### Pubishing Image to AR ###
+      - name: Push Docker image
+        run: |
+          gcloud auth configure-docker ${{ env.GKE_REGION }}-docker.pkg.dev
+          docker push ${{ env.GCP_AR_URL }}/${{ env.NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:${{env.VERSION_NUMBER}}
+          docker push ${{ env.GCP_AR_URL }}/${{ env.NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:latest
+          docker push ${{ env.GCP_AR_URL }}/${{ env.PREDEV_NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:${{env.VERSION_NUMBER}}
+          docker push ${{ env.GCP_AR_URL }}/${{ env.PREDEV_NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:latest
+  
+  # check-matrix:
+  #   runs-on: ubuntu-latest
+  #   needs: [Build_Subgraphs_searchgraph, Build_Subgraphs_recommendationGraph]
+  #   steps:
+  #     - name: Check Build Results
+  #       env:
+  #         SEARCHGRAPH_RESULT: ${{ needs.Build_Subgraphs_searchgraph.result }}
+  #         RECOMMENDATIONGRAPH_RESULT: ${{ needs.Build_Subgraphs_recommendationGraph.result }}
+  #       run: |
+  #         if [ "$SEARCHGRAPH_RESULT" != "success" ] || [ "$RECOMMENDATIONGRAPH_RESULT" != "success" ]; then
+  #           echo "Some builds failed"
+  #           exit 1
+  #         else
+  #           echo "All builds succeeded"
+  #           exit 0
+  #         fi
+
+
+  Deploy:
+    name: Deploy SubGraph Application to Cluster
+    needs: [Build, Build_Subgraphs]
+    runs-on: ubuntu-latest
+    if: success()
+    permissions:
+      contents: read
+      id-token: write
+    continue-on-error: true
+    strategy:
+        matrix:
+          subgraph: ${{ fromJson(needs.build.outputs.subgraph_names_json) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Action for Retrieving PR title
+        uses: ./.github/actions/get-pr-title
+      
+      - name: Run Action for Getting AP DEV Environmental Variables
+        uses: ./.github/actions/get-inputs-dev/ap-dev
+
+      - name: Run Action for GCP Authentication
+        uses: ./.github/actions/gcp_authentication
+        id: gcp-auth
+
+      - id: 'get-credentials'
+        name: Set up GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER }}
+          location: ${{ env.GKE_REGION }}
+          project_id: ${{env.GKE_PROJECT}}
+
+      - name: Extract and set Deployment Name
+        run: |
+          SUBGRAPH_NAME="${{ matrix.subgraph }}"  
+          DEPLOYMENT_NAME=$(echo "$SUBGRAPH_NAME" | tr '[:upper:]' '[:lower:]')
+          echo "SUBGRAPH_NAME=$SUBGRAPH_NAME" >> $GITHUB_ENV
+          echo "DEPLOYMENT_NAME=$DEPLOYMENT_NAME" >> $GITHUB_ENV
+      
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4.2.0
+        with:
+          version: 'latest'
+        id: install
+
+      ## Set Up Helm dependency ###
+      - name: Setup Helm dependency
+        run: |
+          cd helm/
+          echo "GITHUB_WORKSPACE = ${{ github.workspace }}"
+          echo "Current directory: $(pwd)"
+          helm dependency build ./${{ env.DEPLOYMENT_NAME }}
+
+      - name: Parse and Validate PR Body
+        id: parse_pr
+        run: |
+          PR_BODY=$(jq -r '.pull_request.body' < "$GITHUB_EVENT_PATH")
+          echo "PR_BODY Content: $PR_BODY"
+          declare -A SUBGRAPH_IMAGE_TAG
+          while IFS= read -r line; do
+            SUBGRAPH=$(echo "$line" | awk -F'`' '{print $2}' | tr -d '\r')
+            if [[ -n "$SUBGRAPH" ]]; then
+              IMAGE_TAG=$(echo "$PR_BODY" | grep -A 4 "$SUBGRAPH" | grep "AP Region:" | awk -F'`' '{print $2}')
+              SUBGRAPH_IMAGE_TAG["$SUBGRAPH"]=$IMAGE_TAG
+            fi
+          done < <(echo "$PR_BODY" | grep -i "Subgraph Name:")
+          for SUBGRAPH in "${!SUBGRAPH_IMAGE_TAG[@]}"; do
+            echo "${SUBGRAPH}_IMAGE_TAG=${SUBGRAPH_IMAGE_TAG[$SUBGRAPH]}" >> $GITHUB_ENV
+          done
+          echo "Extracted Subgraph imageTags: ${SUBGRAPH_IMAGE_TAG[*]}"
+
+          
+      # helm dry run and check for pre dev prior to helm upgrade ## 
+      - name: Helm dry run predev
+        id: helm_dry_run_predev    
+        run: |   
+          cd helm/
+          echo "Deploying Subgraph: ${{ matrix.subgraph }}"
+          IMAGE_TAG_VAR_NAME="${{ matrix.subgraph }}_IMAGE_TAG"
+          imageTag=${!IMAGE_TAG_VAR_NAME}
+          echo "Dev AP = $imageTag"
+          helm install ${{ env.DEPLOYMENT_NAME }}-${{ env.REGION }}-${{ env.PREDEV_ENVIRONMENT }} ./${{ env.DEPLOYMENT_NAME }} --namespace=${{ env.PREDEV_NAMESPACE }} --values ./${{ env.DEPLOYMENT_NAME }}/${{ env.REGION }}/values.${{ env.PREDEV_ENVIRONMENT }}.yaml --dry-run --debug \
+            --set base-subgraph-helm-chart.image.tag=$imageTag
+  
+          
+        continue-on-error: false 
+
+      - name: Check dry run result of predev
+        if: ${{ steps.helm_dry_run_predev.outcome != 'success' }}
+        run: echo "Dry run failed for predev. Please check the logs and fix the issues."
+        continue-on-error: false 
+      
+      # # helm dry run and check for dev prior to helm upgrade
+      # - name: Helm dry run dev
+      #   id: helm_dry_run_dev    
+      #   run: |    
+      #     cd helm/
+      #     input="${{ vars.IMAGE_TAGS }}"
+
+      #     # Change IFS to comma for splitting the input into services
+      #     IFS=',' read -r -a imageTagArray <<< "$input"
+          
+      #     # Loop through each service and split by '='
+      #     for imageTagList in "${imageTagArray[@]}"; do
+      #         IFS='=' read -r env imageTag <<< "$imageTagList"
+      #         if [[ $env == 'ap-dev' ]]; then
+      #           echo "Service Name: $env, Image Tag: $imageTag"
+      #           helm install ${{ env.DEPLOYMENT_NAME }}-${{ env.REGION }}-${{ env.ENVIRONMENT }} ./${{ env.DEPLOYMENT_NAME }} --namespace=${{ env.NAMESPACE }} --values ./${{ env.DEPLOYMENT_NAME }}/${{ env.REGION }}/values.${{ env.ENVIRONMENT }}.yaml --dry-run --debug \
+      #             --set base-subgraph-helm-chart.image.tag=$imageTag
+      #         fi
+      #     done           
+          
+      #   continue-on-error: false     
+
+
+      ## Deploy Manifest files to GKE Cluster using Helm ###
+      - name: Deploy using Helm in ${{ env.NAMESPACE }} namespace
+        if: ${{ steps.helm_dry_run_predev.outcome == 'success'}}
+        run: |
+          echo "helm Dry run successful for predev, proceeding to next step."           
+          echo "Running Helm deployment to ${{ env.PREDEV_ENVIRONMENT }}"
+          cd helm/
+          echo "Deploying Subgraph: ${{ matrix.subgraph }}"
+          IMAGE_TAG_VAR_NAME="${{ matrix.subgraph }}_IMAGE_TAG"
+          imageTag=${!IMAGE_TAG_VAR_NAME}
+          echo "Dev AP = $imageTag"
+          helm upgrade --install ${{ env.DEPLOYMENT_NAME }}-${{ env.REGION }}-${{ env.PREDEV_ENVIRONMENT }} ./${{ env.DEPLOYMENT_NAME }} \
+            --wait --atomic \
+            --namespace=${{ env.PREDEV_NAMESPACE }} \
+            --set image.tag=$imageTag \
+            --values ./${{ env.DEPLOYMENT_NAME }}/${{env.REGION }}/values.${{ env.PREDEV_ENVIRONMENT }}.yaml
+          echo "helm Dry run successful for dev, proceeding to next step."           
+          echo "Running Helm deployment to ${{ env.ENVIRONMENT }}"
+          helm upgrade --install ${{ env.DEPLOYMENT_NAME }}-${{ env.REGION }}-${{ env.ENVIRONMENT }} ./${{ env.DEPLOYMENT_NAME }} \
+            --wait --atomic \
+            --namespace=${{ env.NAMESPACE }} \
+            --set base-subgraph-helm-chart.image.tag=$imageTag \
+            --values ./${{ env.DEPLOYMENT_NAME }}/${{env.REGION }}/values.${{ env.ENVIRONMENT }}.yaml
+          if [[ $imageTag == 'latest' ]]; then
+            kubectl rollout restart deployments/${{ env.DEPLOYMENT_NAME }}-${{ env.REGION }}-${{ env.ENVIRONMENT }} -n ${{ env.NAMESPACE }}
+            kubectl rollout restart deployments/${{ env.DEPLOYMENT_NAME }}-${{ env.REGION }}-${{ env.PREDEV_ENVIRONMENT }} -n ${{ env.PREDEV_NAMESPACE }}
+          fi
+
+
+
+
+
+
+
